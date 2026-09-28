@@ -636,17 +636,22 @@ def page_dashboard():
 
 def page_students():
     st.subheader("إدارة الطلاب")
-    st.caption("إضافة طالب جديد أو البحث عن طالب مسجل بدون تكرار.")
+    st.caption("إضافة الطلاب والبحث عنهم. تعديل بيانات الطالب متاح للمدير فقط.")
 
     tab_add, tab_list = st.tabs(["إضافة طالب", "قائمة الطلاب"])
+
     with tab_add:
         with st.form("add_student", clear_on_submit=True):
-            name = st.text_input("اسم الطالب الكامل", placeholder="مثال: محمد أحمد علي")
-            phone = st.text_input("رقم الهاتف", placeholder="01XXXXXXXXX")
-            address = st.text_input("العنوان")
-            notes = st.text_area("ملاحظات", height=90)
+            col1, col2 = st.columns(2)
+            with col1:
+                name = st.text_input("اسم الطالب الكامل", placeholder="مثال: محمد أحمد علي")
+                phone = st.text_input("رقم الهاتف", placeholder="01XXXXXXXXX")
+            with col2:
+                address = st.text_input("العنوان")
+                notes = st.text_area("ملاحظات", height=90)
             confirmed = st.checkbox("أؤكد أن الطالب غير مسجل مسبقاً بهذه البيانات")
             save = st.form_submit_button("حفظ الطالب", use_container_width=True)
+
         if save:
             if not name.strip():
                 st.error("اسم الطالب مطلوب.")
@@ -662,32 +667,75 @@ def page_students():
                         return_id=True)
                     log_action("إضافة طالب", "students", student_id, name.strip())
                     st.success(f"تم حفظ الطالب بنجاح — الرقم: {code}")
+                    st.toast("تم حفظ الطالب بنجاح")
                 except sqlite3.IntegrityError as exc:
                     if "DUPLICATE_STUDENT" in str(exc):
                         st.error("هذا الطالب مسجل بالفعل. استخدم البحث في قائمة الطلاب.")
                     else:
                         st.error("تعذر حفظ الطالب. تحقق من البيانات.")
+
     with tab_list:
         search = st.text_input("بحث بالاسم أو الرقم أو الهاتف", key="student_search", placeholder="اكتب جزءاً من الاسم أو الرقم")
         term = f"%{search.strip()}%"
         df = dataframe_query("""SELECT id AS 'ID', student_code AS 'رقم الطالب', name AS 'اسم الطالب',
-                   phone AS 'الهاتف', address AS 'العنوان',
+                   phone AS 'الهاتف', address AS 'العنوان', notes AS 'ملاحظات',
                    CASE WHEN active = 1 THEN 'نشط' ELSE 'موقوف' END AS 'الحالة'
             FROM students WHERE name LIKE ? OR student_code LIKE ? OR phone LIKE ? ORDER BY id DESC""",
             (term, term, term))
         st.dataframe(df, use_container_width=True, hide_index=True)
         if not df.empty:
             download_excel(df, "students.xlsx")
+
+        if has_role("admin") and not df.empty:
+            st.markdown("### تعديل بيانات طالب")
+            student_rows = dataframe_query("SELECT id, student_code, name FROM students ORDER BY name")
+            options = {f"{r['student_code']} - {r['name']}": int(r['id']) for _, r in student_rows.iterrows()}
+            selected = st.selectbox("اختر الطالب المراد تعديله", list(options.keys()), key="edit_student_select")
+            row = dataframe_query("SELECT * FROM students WHERE id = ?", (options[selected],)).iloc[0]
+            with st.form("edit_student_form"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    edit_name = st.text_input("اسم الطالب", value=str(row.get("name") or ""))
+                    edit_phone = st.text_input("رقم الهاتف", value=str(row.get("phone") or ""))
+                with c2:
+                    edit_address = st.text_input("العنوان", value=str(row.get("address") or ""))
+                    edit_notes = st.text_area("ملاحظات", value=str(row.get("notes") or ""), height=90)
+                edit_active = st.checkbox("الطالب نشط", value=bool(row.get("active", 1)))
+                confirm_edit = st.checkbox("أؤكد حفظ التعديل", key="confirm_student_edit")
+                update = st.form_submit_button("حفظ تعديل الطالب", use_container_width=True)
+            if update:
+                if not confirm_edit:
+                    st.warning("ضع علامة التأكيد أولاً.")
+                elif not edit_name.strip():
+                    st.error("اسم الطالب مطلوب.")
+                else:
+                    try:
+                        execute("""UPDATE students SET name=?, phone=?, address=?, notes=?, active=? WHERE id=?""",
+                                (edit_name.strip(), edit_phone.strip(), edit_address.strip(), edit_notes.strip(), int(edit_active), int(row["id"])))
+                        log_action("تعديل طالب", "students", int(row["id"]), edit_name.strip())
+                        st.success("تم تعديل بيانات الطالب.")
+                        st.toast("تم تحديث بيانات الطالب")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("تعذر التعديل. قد يكون الاسم مستخدماً لطالب آخر.")
+        elif not has_role("admin"):
+            st.info("تعديل بيانات الطلاب متاح للمدير فقط.")
+
+
 def page_teachers():
     st.subheader("إدارة الأساتذة")
-    st.caption("إضافة الأستاذ مرة واحدة ثم ربطه بالكورسات من شاشة الكورسات.")
+    st.caption("إضافة الأستاذ وربطه بالكورسات. تعديل بيانات الأستاذ وأجره متاح للمدير فقط.")
+
     tab_add, tab_list = st.tabs(["إضافة أستاذ", "قائمة الأساتذة"])
     with tab_add:
         with st.form("add_teacher", clear_on_submit=True):
-            name = st.text_input("اسم الأستاذ الكامل", placeholder="مثال: أ. أحمد محمد")
-            subject = st.text_input("المادة / التخصص")
-            phone = st.text_input("رقم الهاتف")
-            rate = st.number_input("سعر الساعة", min_value=0.0, step=100.0)
+            col1, col2 = st.columns(2)
+            with col1:
+                name = st.text_input("اسم الأستاذ الكامل", placeholder="مثال: أ. أحمد محمد")
+                subject = st.text_input("المادة / التخصص")
+            with col2:
+                phone = st.text_input("رقم الهاتف")
+                rate = st.number_input("أجر الساعة", min_value=0.0, step=100.0)
             confirmed = st.checkbox("أؤكد أن الأستاذ غير مسجل مسبقاً")
             save = st.form_submit_button("حفظ الأستاذ", use_container_width=True)
         if save:
@@ -705,92 +753,122 @@ def page_teachers():
                         return_id=True)
                     log_action("إضافة أستاذ", "teachers", teacher_id, name.strip())
                     st.success(f"تم حفظ الأستاذ بنجاح — الرقم: {code}")
+                    st.toast("تم حفظ الأستاذ بنجاح")
                 except sqlite3.IntegrityError as exc:
                     if "DUPLICATE_TEACHER" in str(exc):
                         st.error("هذا الأستاذ مسجل بالفعل. استخدم قائمة الأساتذة.")
                     else:
                         st.error("تعذر حفظ الأستاذ. تحقق من البيانات.")
+
     with tab_list:
         search = st.text_input("بحث بالاسم أو الرقم أو المادة", key="teacher_search", placeholder="اكتب جزءاً من الاسم")
         term = f"%{search.strip()}%"
         df = dataframe_query("""SELECT id AS 'ID', teacher_code AS 'رقم الأستاذ', name AS 'اسم الأستاذ',
-                   subject AS 'المادة', phone AS 'الهاتف', hourly_rate AS 'سعر الساعة',
+                   subject AS 'المادة', phone AS 'الهاتف', hourly_rate AS 'أجر الساعة',
                    CASE WHEN active = 1 THEN 'نشط' ELSE 'موقوف' END AS 'الحالة'
             FROM teachers WHERE name LIKE ? OR teacher_code LIKE ? OR subject LIKE ? ORDER BY id DESC""",
             (term, term, term))
         st.dataframe(df, use_container_width=True, hide_index=True)
         if not df.empty:
             download_excel(df, "teachers.xlsx")
+
+        if has_role("admin") and not df.empty:
+            st.markdown("### تعديل بيانات الأستاذ")
+            teacher_rows = dataframe_query("SELECT id, teacher_code, name FROM teachers ORDER BY name")
+            options = {f"{r['teacher_code']} - {r['name']}": int(r['id']) for _, r in teacher_rows.iterrows()}
+            selected = st.selectbox("اختر الأستاذ المراد تعديله", list(options.keys()), key="edit_teacher_select")
+            row = dataframe_query("SELECT * FROM teachers WHERE id = ?", (options[selected],)).iloc[0]
+            with st.form("edit_teacher_form"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    edit_name = st.text_input("اسم الأستاذ", value=str(row.get("name") or ""))
+                    edit_subject = st.text_input("المادة / التخصص", value=str(row.get("subject") or ""))
+                with c2:
+                    edit_phone = st.text_input("رقم الهاتف", value=str(row.get("phone") or ""))
+                    edit_rate = st.number_input("أجر الساعة", min_value=0.0, step=100.0, value=float(row.get("hourly_rate") or 0))
+                edit_active = st.checkbox("الأستاذ نشط", value=bool(row.get("active", 1)))
+                confirm_edit = st.checkbox("أؤكد حفظ التعديل", key="confirm_teacher_edit")
+                update = st.form_submit_button("حفظ تعديل الأستاذ", use_container_width=True)
+            if update:
+                if not confirm_edit:
+                    st.warning("ضع علامة التأكيد أولاً.")
+                elif not edit_name.strip():
+                    st.error("اسم الأستاذ مطلوب.")
+                else:
+                    try:
+                        execute("""UPDATE teachers SET name=?, subject=?, phone=?, hourly_rate=?, active=? WHERE id=?""",
+                                (edit_name.strip(), edit_subject.strip(), edit_phone.strip(), edit_rate, int(edit_active), int(row["id"])))
+                        log_action("تعديل أستاذ", "teachers", int(row["id"]), f"{edit_name.strip()} | أجر الساعة: {edit_rate:g}")
+                        st.success("تم تعديل بيانات الأستاذ وأجره.")
+                        st.toast("تم تحديث بيانات الأستاذ")
+                        st.rerun()
+                    except sqlite3.IntegrityError:
+                        st.error("تعذر التعديل. قد يكون الاسم مستخدماً لأستاذ آخر.")
+        elif not has_role("admin"):
+            st.info("تعديل بيانات الأساتذة وأجورهم متاح للمدير فقط.")
+
+
 def page_subjects_courses():
     st.subheader("المواد والكورسات")
+    st.caption("يمكن إنشاء المادة أو الكورس بشكل مستقل. لا يلزم تسجيل أي طالب داخل الكورس عند إنشائه.")
 
-    tab_subject, tab_course, tab_enroll = st.tabs(
-        ["المواد", "الكورسات", "تسجيل طالب في كورس"]
-    )
+    tab_subject, tab_course = st.tabs(["المواد", "الكورسات"])
 
     with tab_subject:
-        with st.form("add_subject"):
-            name = st.text_input("اسم المادة")
-            description = st.text_area("الوصف")
-            save = st.form_submit_button("حفظ المادة")
+        with st.form("add_subject", clear_on_submit=True):
+            col1, col2 = st.columns([1, 2])
+            with col1:
+                name = st.text_input("اسم المادة", placeholder="مثال: محاسبة متوسطة")
+            with col2:
+                description = st.text_area("وصف المادة", height=90)
+            confirmed = st.checkbox("أؤكد أن المادة غير مسجلة مسبقاً", key="confirm_subject")
+            save = st.form_submit_button("حفظ المادة", use_container_width=True)
 
         if save:
             if not name.strip():
                 st.error("اسم المادة مطلوب.")
+            elif not confirmed:
+                st.warning("ضع علامة التأكيد قبل حفظ المادة.")
             else:
                 try:
                     subject_id = execute(
                         "INSERT INTO subjects (name, description, active) VALUES (?, ?, 1)",
-                        (name.strip(), description.strip()),
-                        return_id=True,
-                    )
+                        (name.strip(), description.strip()), return_id=True)
                     log_action("إضافة مادة", "subjects", subject_id, name.strip())
                     st.success("تم حفظ المادة.")
+                    st.toast("تم حفظ المادة")
                 except sqlite3.IntegrityError:
                     st.error("هذه المادة موجودة بالفعل.")
 
         st.dataframe(
-            dataframe_query(
-                """
-                SELECT id AS 'ID', name AS 'المادة', description AS 'الوصف'
-                FROM subjects
-                WHERE active = 1
-                ORDER BY name
-                """
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+            dataframe_query("""SELECT id AS 'ID', name AS 'المادة', description AS 'الوصف'
+                FROM subjects WHERE active = 1 ORDER BY name"""),
+            use_container_width=True, hide_index=True)
 
     with tab_course:
-        subjects = dataframe_query(
-            "SELECT id, name FROM subjects WHERE active = 1 ORDER BY name"
-        )
-        teachers = dataframe_query(
-            "SELECT id, name FROM teachers WHERE active = 1 ORDER BY name"
-        )
+        subjects = dataframe_query("SELECT id, name FROM subjects WHERE active = 1 ORDER BY name")
+        teachers = dataframe_query("SELECT id, name FROM teachers WHERE active = 1 ORDER BY name")
 
-        if subjects.empty or teachers.empty:
-            st.info("أضف مادة وأستاذاً أولاً.")
+        if subjects.empty:
+            st.warning("أضف مادة أولاً حتى تتمكن من إنشاء الكورس.")
+        elif teachers.empty:
+            st.warning("أضف أستاذاً أولاً حتى تتمكن من إنشاء الكورس.")
         else:
             subject_options = dict(zip(subjects["name"], subjects["id"]))
             teacher_options = dict(zip(teachers["name"], teachers["id"]))
 
-            with st.form("add_course"):
-                course_name = st.text_input("اسم الكورس")
-                selected_subject = st.selectbox(
-                    "المادة", list(subject_options.keys())
-                )
-                selected_teacher = st.selectbox(
-                    "الأستاذ", list(teacher_options.keys())
-                )
-                fee = st.number_input("رسوم الكورس", min_value=0.0, step=100.0)
-                sessions = st.number_input(
-                    "عدد الحصص", min_value=0, step=1, value=0
-                )
-                start_date = st.date_input("بداية الكورس", today())
-                end_date = st.date_input("نهاية الكورس", today())
-                confirmed = st.checkbox("أؤكد أن هذا الكورس غير مسجل بنفس المادة والأستاذ")
+            with st.form("add_course", clear_on_submit=True):
+                col1, col2 = st.columns(2)
+                with col1:
+                    course_name = st.text_input("اسم الكورس", placeholder="مثال: كورس المحاسبة المتوسطة")
+                    selected_subject = st.selectbox("المادة", list(subject_options.keys()))
+                    selected_teacher = st.selectbox("الأستاذ", list(teacher_options.keys()))
+                with col2:
+                    fee = st.number_input("رسوم الكورس", min_value=0.0, step=100.0)
+                    sessions = st.number_input("عدد الحصص", min_value=0, step=1, value=0)
+                    start_date = st.date_input("بداية الكورس", today())
+                    end_date = st.date_input("نهاية الكورس", today())
+                confirmed = st.checkbox("أؤكد أن هذا الكورس غير مسجل مسبقاً", key="confirm_course")
                 save = st.form_submit_button("حفظ الكورس", use_container_width=True)
 
             if save:
@@ -802,111 +880,29 @@ def page_subjects_courses():
                     st.warning("ضع علامة التأكيد قبل حفظ الكورس.")
                 else:
                     try:
-                        course_id = execute(
-                            """
-                            INSERT INTO courses
-                            (name, subject_id, teacher_id, fee, total_sessions,
-                             start_date, end_date, active)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                            """,
-                            (
-                                course_name.strip(),
-                                subject_options[selected_subject],
-                                teacher_options[selected_teacher],
-                                fee,
-                                sessions,
-                                str(start_date),
-                                str(end_date),
-                            ),
-                            return_id=True,
-                        )
-                        log_action("إضافة كورس", "courses", course_id, course_name)
-                        st.success("تم حفظ الكورس.")
+                        course_id = execute("""INSERT INTO courses
+                            (name, subject_id, teacher_id, fee, total_sessions, start_date, end_date, active)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 1)""",
+                            (course_name.strip(), subject_options[selected_subject], teacher_options[selected_teacher],
+                             fee, sessions, str(start_date), str(end_date)), return_id=True)
+                        log_action("إضافة كورس", "courses", course_id, course_name.strip())
+                        st.success("تم حفظ الكورس بنجاح. لم يتم تسجيل أي طالب فيه.")
+                        st.toast("تم إنشاء الكورس")
                     except sqlite3.IntegrityError as exc:
                         if "DUPLICATE_COURSE" in str(exc):
                             st.error("هذا الكورس مسجل بالفعل بنفس المادة والأستاذ.")
                         else:
                             st.error("تعذر حفظ الكورس. تحقق من البيانات.")
 
-            courses = dataframe_query(
-                """
-                SELECT c.id AS 'ID',
-                       c.name AS 'الكورس',
-                       s.name AS 'المادة',
-                       t.name AS 'الأستاذ',
-                       c.fee AS 'الرسوم',
-                       c.total_sessions AS 'عدد الحصص',
-                       c.start_date AS 'البداية',
-                       c.end_date AS 'النهاية'
-                FROM courses c
-                LEFT JOIN subjects s ON s.id = c.subject_id
-                LEFT JOIN teachers t ON t.id = c.teacher_id
-                WHERE c.active = 1
-                ORDER BY c.id DESC
-                """
-            )
+            courses = dataframe_query("""SELECT c.id AS 'ID', c.name AS 'الكورس',
+                s.name AS 'المادة', t.name AS 'الأستاذ', c.fee AS 'الرسوم',
+                c.total_sessions AS 'عدد الحصص', c.start_date AS 'البداية', c.end_date AS 'النهاية'
+                FROM courses c LEFT JOIN subjects s ON s.id=c.subject_id
+                LEFT JOIN teachers t ON t.id=c.teacher_id
+                WHERE c.active=1 ORDER BY c.id DESC""")
             st.dataframe(courses, use_container_width=True, hide_index=True)
-
-    with tab_enroll:
-        students = dataframe_query(
-            "SELECT id, name, student_code FROM students WHERE active = 1 ORDER BY name"
-        )
-        courses = dataframe_query(
-            "SELECT id, name, fee FROM courses WHERE active = 1 ORDER BY name"
-        )
-
-        if students.empty or courses.empty:
-            st.info("أضف طلاباً وكورسات أولاً.")
-        else:
-            student_options = {
-                f"{r['student_code']} - {r['name']}": r["id"]
-                for _, r in students.iterrows()
-            }
-            course_options = {
-                f"{r['name']} - {format_money(r['fee'])}": r["id"]
-                for _, r in courses.iterrows()
-            }
-
-            with st.form("enroll_student"):
-                selected_student = st.selectbox(
-                    "الطالب", list(student_options.keys())
-                )
-                selected_course = st.selectbox(
-                    "الكورس", list(course_options.keys())
-                )
-                agreed_fee = st.number_input(
-                    "الرسوم المتفق عليها", min_value=0.0, step=100.0
-                )
-                enrolled_date = st.date_input("تاريخ التسجيل", today())
-                save = st.form_submit_button("تسجيل الطالب")
-
-            if save:
-                if not require_day_open(enrolled_date):
-                    return
-                try:
-                    enrollment_id = execute(
-                        """
-                        INSERT INTO enrollments
-                        (student_id, course_id, agreed_fee, enrolled_date, status)
-                        VALUES (?, ?, ?, ?, 'active')
-                        """,
-                        (
-                            student_options[selected_student],
-                            course_options[selected_course],
-                            agreed_fee,
-                            str(enrolled_date),
-                        ),
-                        return_id=True,
-                    )
-                    log_action(
-                        "تسجيل طالب في كورس",
-                        "enrollments",
-                        enrollment_id,
-                        selected_student,
-                    )
-                    st.success("تم تسجيل الطالب في الكورس.")
-                except sqlite3.IntegrityError:
-                    st.error("الطالب مسجل بالفعل في هذا الكورس.")
+            if not courses.empty:
+                download_excel(courses, "courses.xlsx")
 
 
 def page_student_attendance():
@@ -1025,132 +1021,84 @@ def page_student_attendance():
 
 def page_payment():
     st.subheader("تسجيل دفع طالب")
+    st.caption("الكورس اختياري. يمكنك تسجيل الدفعة للطالب بدون ربطها بكورس.")
 
-    students = dataframe_query(
-        """
-        SELECT id, student_code, name
-        FROM students
-        WHERE active = 1
-        ORDER BY name
-        """
-    )
-    courses = dataframe_query(
-        """
-        SELECT c.id, c.name, c.teacher_id, c.fee, t.name AS teacher_name
-        FROM courses c
-        LEFT JOIN teachers t ON t.id = c.teacher_id
-        WHERE c.active = 1
-        ORDER BY c.name
-        """
-    )
+    students = dataframe_query("""SELECT id, student_code, name FROM students WHERE active = 1 ORDER BY name""")
+    courses = dataframe_query("""SELECT c.id, c.name, c.teacher_id, c.fee, t.name AS teacher_name
+        FROM courses c LEFT JOIN teachers t ON t.id = c.teacher_id
+        WHERE c.active = 1 ORDER BY c.name""")
 
     if students.empty:
         st.info("أضف طلاباً أولاً.")
         return
 
-    student_options = {
-        f"{r['student_code']} - {r['name']}": r["id"]
-        for _, r in students.iterrows()
-    }
-
+    student_options = {f"{r['student_code']} - {r['name']}": int(r['id']) for _, r in students.iterrows()}
     course_options = {"بدون كورس": None}
     course_data = {}
     for _, row in courses.iterrows():
         label = f"{row['name']} - {row['teacher_name'] or 'بدون أستاذ'}"
-        course_options[label] = row["id"]
-        course_data[row["id"]] = row
+        course_options[label] = int(row['id'])
+        course_data[int(row['id'])] = row
+
+    # اختيار طريقة الدفع خارج الـ form حتى تتغير الواجهة فوراً عند اختيار بنكك.
+    method = st.radio("طريقة الدفع", ["كاش", "بنكك"], horizontal=True, key="payment_method")
+    if method == "بنكك":
+        st.markdown('<div class="bankak-box"><div class="bankak-title">دفع عبر بنكك</div><div class="bankak-note">أدخل رقم العملية كما هو ظاهر في إشعار بنكك. الرقم مطلوب قبل الحفظ.</div></div>', unsafe_allow_html=True)
+        transaction_number = st.text_input("رقم عملية بنكك", placeholder="أدخل رقم العملية هنا", key="bankak_transaction")
+    else:
+        transaction_number = ""
 
     with st.form("payment_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
-
         with col1:
-            selected_student = st.selectbox(
-                "الطالب", list(student_options.keys())
-            )
-            amount = st.number_input(
-                "المبلغ", min_value=0.0, step=100.0
-            )
+            selected_student = st.selectbox("الطالب", list(student_options.keys()))
+            amount = st.number_input("المبلغ", min_value=0.0, step=100.0)
             payment_date = st.date_input("التاريخ", today())
-
         with col2:
-            selected_course = st.selectbox(
-                "الكورس", list(course_options.keys())
-            )
-            method = st.selectbox("طريقة الدفع", ["كاش", "بنكك"])
-
-        transaction_number = ""
-        if method == "بنكك":
-            transaction_number = st.text_input("رقم عملية بنكك")
-
-        notes = st.text_input("ملاحظات")
-        save = st.form_submit_button("حفظ العملية")
+            selected_course = st.selectbox("الكورس", list(course_options.keys()))
+            notes = st.text_input("ملاحظات")
+        confirm = st.checkbox("أؤكد أن بيانات الدفعة صحيحة")
+        save = st.form_submit_button("حفظ العملية", use_container_width=True)
 
     if save:
+        if not confirm:
+            st.warning("ضع علامة التأكيد قبل حفظ العملية.")
+            return
         if not require_day_open(payment_date):
             return
         if amount <= 0:
             st.error("المبلغ يجب أن يكون أكبر من صفر.")
             return
-
         if method == "بنكك" and not transaction_number.strip():
             st.error("رقم عملية بنكك مطلوب.")
             return
 
         if method == "بنكك":
-            existing = dataframe_query(
-                """
-                SELECT id FROM student_payments
-                WHERE payment_method = 'بنكك'
-                  AND transaction_number = ?
-                  AND status = 'completed'
-                """,
-                (transaction_number.strip(),),
-            )
+            existing = dataframe_query("""SELECT id FROM student_payments
+                WHERE payment_method='بنكك' AND transaction_number=? AND status='completed'""",
+                (transaction_number.strip(),))
             if not existing.empty:
                 st.error("رقم عملية بنكك مستخدم من قبل.")
                 return
 
         student_id = student_options[selected_student]
         course_id = course_options[selected_course]
-        teacher_id = (
-            int(course_data[course_id]["teacher_id"])
-            if course_id and pd.notna(course_data[course_id]["teacher_id"])
-            else None
-        )
+        teacher_id = None
+        if course_id and pd.notna(course_data[course_id]["teacher_id"]):
+            teacher_id = int(course_data[course_id]["teacher_id"])
 
         try:
-            payment_id = execute(
-                """
-                INSERT INTO student_payments
-                (student_id, teacher_id, course_id, date, amount,
-                 payment_method, transaction_number, notes, status,
-                 created_by, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)
-                """,
-                (
-                    student_id,
-                    teacher_id,
-                    course_id,
-                    str(payment_date),
-                    amount,
-                    method,
-                    transaction_number.strip(),
-                    notes.strip(),
-                    current_user()["id"],
-                    now_text(),
-                ),
-                return_id=True,
-            )
-            log_action(
-                "تسجيل دفع",
-                "student_payments",
-                payment_id,
-                f"{selected_student} - {format_money(amount)}",
-            )
+            payment_id = execute("""INSERT INTO student_payments
+                (student_id, teacher_id, course_id, date, amount, payment_method,
+                 transaction_number, notes, status, created_by, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'completed', ?, ?)""",
+                (student_id, teacher_id, course_id, str(payment_date), amount, method,
+                 transaction_number.strip(), notes.strip(), current_user()["id"], now_text()), return_id=True)
+            log_action("تسجيل دفع", "student_payments", payment_id,
+                       f"{selected_student} - {format_money(amount)} - {method}")
             st.success("تم تسجيل العملية بنجاح.")
-            st.info(
-                f"المبلغ: {format_money(amount)} | طريقة الدفع: {method}"
-            )
+            st.toast("تم حفظ الدفعة بنجاح")
+            st.info(f"المبلغ: {format_money(amount)} | طريقة الدفع: {method}")
         except sqlite3.IntegrityError:
             st.error("تعذر حفظ العملية. قد يكون رقم بنكك مستخدماً بالفعل.")
 
@@ -1940,37 +1888,69 @@ def page_database_tools():
 def apply_css():
     st.markdown("""
     <style>
-    :root { --brand:#1f6f78; --brand-dark:#174f56; --surface:#fff; --page:#f3f6f8; --text:#20303a; --muted:#6b7b84; --border:#dfe7eb; }
-    .stApp { background:var(--page); }
-    .block-container { padding-top:1.6rem; padding-bottom:3rem; max-width:1450px; }
-    [data-testid="stSidebar"] { background:linear-gradient(180deg,#173f46 0%,#1f5d64 58%,#174f56 100%); }
-    [data-testid="stSidebar"] * { color:#f5f8f9 !important; }
-    [data-testid="stSidebar"] [data-testid="stRadio"] label { border-radius:9px; padding:7px 10px; transition:.18s ease; }
-    [data-testid="stSidebar"] [data-testid="stRadio"] label:hover { background:rgba(255,255,255,.09); transform:translateX(-2px); }
-    h1,h2,h3,h4 { color:var(--text) !important; letter-spacing:-.2px; }
-    p,label,.stMarkdown,.stCaption { color:var(--text); }
-    input,textarea,[data-baseweb="select"] > div { color:var(--text) !important; background:#fff !important; border-color:var(--border) !important; }
-    input::placeholder,textarea::placeholder { color:#8b989f !important; opacity:1 !important; }
-    div.stButton > button { border:0; border-radius:9px; min-height:42px; font-weight:650; transition:transform .16s ease,box-shadow .16s ease; }
-    div.stButton > button:hover { transform:translateY(-1px); box-shadow:0 7px 18px rgba(25,55,65,.12); }
-    [data-testid="stForm"] { border:1px solid var(--border); border-radius:14px; background:rgba(255,255,255,.84); padding:8px 10px 2px; box-shadow:0 5px 18px rgba(32,48,58,.045); }
-    [data-testid="stMetric"] { background:#fff; border:1px solid var(--border); border-radius:14px; padding:14px 16px; box-shadow:0 5px 16px rgba(32,48,58,.045); animation:rise .45s ease both; }
-    [data-testid="stMetricValue"] { color:var(--brand-dark) !important; font-size:1.5rem !important; }
-    [data-testid="stDataFrame"] { border-radius:12px; overflow:hidden; border:1px solid var(--border); }
-    .app-header { background:linear-gradient(120deg,#1b5961 0%,#267b82 100%); color:white; border-radius:17px; padding:24px 28px; margin-bottom:22px; box-shadow:0 10px 28px rgba(24,75,83,.16); position:relative; overflow:hidden; animation:fadeSlide .5s ease both; }
-    .app-header:after { content:""; position:absolute; width:230px; height:230px; border:1px solid rgba(255,255,255,.12); border-radius:50%; left:-70px; bottom:-150px; }
-    .app-header h1 { color:white !important; margin:0 0 5px 0; font-size:1.8rem; }
-    .app-header p { color:rgba(255,255,255,.82) !important; margin:0; }
-    .login-shell { max-width:520px; margin:7vh auto 0; background:#fff; border:1px solid var(--border); border-radius:18px; padding:30px 32px 24px; box-shadow:0 16px 45px rgba(25,55,65,.10); animation:loginIn .55s ease both; }
-    .login-brand { color:var(--brand); font-size:14px; font-weight:700; margin-bottom:8px; }
+    :root {
+        --brand:#176b87;
+        --brand-dark:#0e4358;
+        --blue:#2878c8;
+        --teal:#149b9b;
+        --green:#238b67;
+        --gold:#d49a2a;
+        --red:#c95757;
+        --purple:#7358b7;
+        --surface:#ffffff;
+        --page:#f3f7fa;
+        --text:#1e2d36;
+        --muted:#71818b;
+        --border:#dbe5eb;
+    }
+    .stApp { background:linear-gradient(135deg,#f4f8fb 0%,#eef6f6 52%,#f7f4fb 100%); color:var(--text); }
+    .block-container { padding-top:1.35rem; padding-bottom:3rem; max-width:1480px; }
+    [data-testid="stSidebar"] { background:linear-gradient(180deg,#0f4054 0%,#12677c 45%,#194b69 100%); box-shadow:8px 0 25px rgba(15,64,84,.12); }
+    [data-testid="stSidebar"] * { color:#f7fbfd !important; }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label { border-radius:10px; padding:8px 11px; margin:2px 0; transition:all .18s ease; }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:hover { background:rgba(255,255,255,.12); transform:translateX(-3px); }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label[data-checked="true"] { background:linear-gradient(90deg,rgba(255,255,255,.18),rgba(255,255,255,.07)); box-shadow:inset 3px 0 0 #55d1d1; }
+    h1,h2,h3,h4 { color:var(--text) !important; letter-spacing:-.25px; font-family:"Segoe UI",Tahoma,Arial,sans-serif; }
+    p,label,.stMarkdown,.stCaption { color:var(--text); font-family:"Segoe UI",Tahoma,Arial,sans-serif; }
+    input,textarea,[data-baseweb="select"] > div { color:var(--text) !important; background:#fff !important; border-color:var(--border) !important; border-radius:9px !important; }
+    input:focus,textarea:focus { border-color:#3aa7b3 !important; box-shadow:0 0 0 2px rgba(58,167,179,.12) !important; }
+    input::placeholder,textarea::placeholder { color:#91a0a8 !important; opacity:1 !important; }
+    div.stButton > button { border:0; border-radius:10px; min-height:42px; font-weight:700; color:#fff; background:linear-gradient(110deg,var(--brand),var(--blue)); transition:transform .16s ease,box-shadow .16s ease,filter .16s ease; }
+    div.stButton > button:hover { transform:translateY(-2px); box-shadow:0 9px 20px rgba(23,107,135,.18); filter:saturate(1.08); }
+    [data-testid="stForm"] { border:1px solid rgba(205,220,228,.9); border-radius:16px; background:rgba(255,255,255,.91); padding:10px 12px 4px; box-shadow:0 8px 24px rgba(24,52,65,.055); animation:softIn .32s ease both; }
+    [data-testid="stMetric"] { background:#fff; border:1px solid var(--border); border-radius:15px; padding:14px 16px; box-shadow:0 7px 18px rgba(24,52,65,.055); animation:rise .42s ease both; position:relative; overflow:hidden; }
+    [data-testid="stMetric"]:after { content:""; position:absolute; right:-25px; top:-28px; width:78px; height:78px; border-radius:50%; background:rgba(40,120,200,.07); }
+    [data-testid="stMetricValue"] { color:var(--brand-dark) !important; font-size:1.48rem !important; }
+    [data-testid="stDataFrame"] { border-radius:13px; overflow:hidden; border:1px solid var(--border); box-shadow:0 5px 16px rgba(24,52,65,.04); }
+    .app-header { background:linear-gradient(120deg,#104e68 0%,#176b87 45%,#197f83 100%); color:#fff; border-radius:19px; padding:25px 29px; margin-bottom:23px; box-shadow:0 12px 30px rgba(16,78,104,.17); position:relative; overflow:hidden; animation:fadeSlide .48s ease both; }
+    .app-header:before { content:""; position:absolute; width:280px; height:280px; border:1px solid rgba(255,255,255,.11); border-radius:50%; left:-80px; bottom:-185px; }
+    .app-header:after { content:""; position:absolute; width:150px; height:150px; border:1px solid rgba(255,255,255,.08); border-radius:50%; right:-55px; top:-70px; }
+    .app-header h1 { color:#fff !important; margin:0 0 5px; font-size:1.85rem; }
+    .app-header p { color:rgba(255,255,255,.84) !important; margin:0; }
+    .section-note { color:var(--muted); margin-top:-7px; margin-bottom:14px; }
+    .bankak-box { border:1px solid #91d6d2; border-right:5px solid #159b9b; background:linear-gradient(100deg,#effafa,#f6fcfc); border-radius:13px; padding:12px 15px; margin:5px 0 12px; animation:bankakIn .25s ease both; }
+    .bankak-title { color:#0c6f73; font-weight:800; font-size:1rem; }
+    .bankak-note { color:#5d7379; font-size:.85rem; margin-top:3px; }
+    .login-shell { max-width:520px; margin:7vh auto 0; background:#fff; border:1px solid var(--border); border-radius:20px; padding:31px 33px 25px; box-shadow:0 18px 48px rgba(25,55,65,.11); animation:loginIn .55s ease both; }
+    .login-brand { color:var(--brand); font-size:14px; font-weight:800; margin-bottom:8px; }
     .login-title { color:var(--text); font-size:28px; font-weight:800; }
     .login-subtitle { color:var(--muted); margin:4px 0 22px; font-size:14px; }
-    .section-note { color:var(--muted); margin-top:-7px; margin-bottom:14px; }
-    @keyframes fadeSlide { from{opacity:0;transform:translateY(7px)} to{opacity:1;transform:translateY(0)} }
-    @keyframes rise { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    .stTabs [data-baseweb="tab-list"] { gap:7px; }
+    .stTabs [data-baseweb="tab"] { border-radius:9px; padding:8px 15px; transition:all .18s ease; }
+    .stTabs [data-baseweb="tab"]:hover { background:#eaf5f7; }
+    .stTabs [aria-selected="true"] { background:#e1f3f4; color:#0d6670 !important; }
+    div[data-testid="stRadio"] > div { gap:8px; }
+    div[data-testid="stRadio"] label { border:1px solid var(--border); border-radius:10px; padding:8px 14px; background:#fff; transition:all .18s ease; }
+    div[data-testid="stRadio"] label:hover { border-color:#6fc2c7; transform:translateY(-1px); }
+    @keyframes fadeSlide { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes rise { from{opacity:0;transform:translateY(7px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes softIn { from{opacity:.3;transform:translateY(4px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes bankakIn { from{opacity:0;transform:translateX(8px)} to{opacity:1;transform:translateX(0)} }
     @keyframes loginIn { from{opacity:0;transform:translateY(12px) scale(.99)} to{opacity:1;transform:translateY(0) scale(1)} }
     </style>
     """, unsafe_allow_html=True)
+
+
 def main():
     st.set_page_config(
         page_title="نظام إدارة المركز التعليمي",
