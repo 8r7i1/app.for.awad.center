@@ -200,6 +200,19 @@ def init_db():
             FOREIGN KEY(closed_by) REFERENCES users(id)
         );
 
+        CREATE TABLE IF NOT EXISTS day_closures (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL UNIQUE,
+            closed_by INTEGER NOT NULL,
+            closed_at TEXT NOT NULL,
+            reopened_by INTEGER,
+            reopened_at TEXT,
+            status TEXT NOT NULL DEFAULT 'closed',
+            notes TEXT,
+            FOREIGN KEY(closed_by) REFERENCES users(id),
+            FOREIGN KEY(reopened_by) REFERENCES users(id)
+        );
+
         CREATE TABLE IF NOT EXISTS audit_logs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -297,6 +310,30 @@ def init_db():
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date)"
+    )
+
+    conn.executescript(
+        """
+        CREATE TRIGGER IF NOT EXISTS prevent_duplicate_student
+        BEFORE INSERT ON students
+        WHEN EXISTS (SELECT 1 FROM students WHERE lower(trim(name)) = lower(trim(NEW.name)))
+        BEGIN SELECT RAISE(ABORT, 'DUPLICATE_STUDENT'); END;
+
+        CREATE TRIGGER IF NOT EXISTS prevent_duplicate_teacher
+        BEFORE INSERT ON teachers
+        WHEN EXISTS (SELECT 1 FROM teachers WHERE lower(trim(name)) = lower(trim(NEW.name)))
+        BEGIN SELECT RAISE(ABORT, 'DUPLICATE_TEACHER'); END;
+
+        CREATE TRIGGER IF NOT EXISTS prevent_duplicate_course
+        BEFORE INSERT ON courses
+        WHEN EXISTS (
+            SELECT 1 FROM courses
+            WHERE lower(trim(name)) = lower(trim(NEW.name))
+              AND COALESCE(subject_id, 0) = COALESCE(NEW.subject_id, 0)
+              AND COALESCE(teacher_id, 0) = COALESCE(NEW.teacher_id, 0)
+        )
+        BEGIN SELECT RAISE(ABORT, 'DUPLICATE_COURSE'); END;
+        """
     )
 
     conn.commit()
@@ -399,6 +436,31 @@ def now_text():
     return dt.datetime.now().isoformat(timespec="seconds")
 
 
+def is_day_closed(date_value):
+    date_str = str(date_value)
+    conn = get_connection()
+    row = conn.execute(
+        "SELECT status FROM day_closures WHERE date = ? AND status = 'closed'",
+        (date_str,),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def day_lock_message(date_value):
+    return (
+        f"اليوم {date_value} مقفل. لا يمكن تسجيل عملية جديدة لهذا التاريخ. "
+        "إذا كان هناك خطأ، يجب على المدير فتح اليوم أولاً من شاشة الخزينة."
+    )
+
+
+def require_day_open(date_value):
+    if is_day_closed(date_value):
+        st.error(day_lock_message(date_value))
+        return False
+    return True
+
+
 def generate_code(prefix, table):
     conn = get_connection()
     row = conn.execute(f"SELECT id FROM {table} ORDER BY id DESC LIMIT 1").fetchone()
@@ -451,58 +513,47 @@ def download_excel(df, filename="report.xlsx"):
 
 
 def login_screen():
-    st.title("نظام إدارة المركز التعليمي")
-
+    st.markdown('<div class="login-shell">', unsafe_allow_html=True)
+    st.markdown('<div class="login-brand">مركز التعليم</div>', unsafe_allow_html=True)
+    st.markdown('<div class="login-title">نظام إدارة المركز</div>', unsafe_allow_html=True)
+    st.markdown('<div class="login-subtitle">تسجيل الدخول إلى لوحة الإدارة</div>', unsafe_allow_html=True)
     if get_user_count() == 0:
-        st.subheader("إنشاء حساب المدير")
-        st.info("هذه الشاشة تظهر مرة واحدة عند أول تشغيل للنظام.")
-
+        st.info("أنشئ حساب المدير أولاً. هذه الشاشة تظهر في أول تشغيل فقط.")
         with st.form("first_admin"):
-            full_name = st.text_input("اسم المدير")
-            username = st.text_input("اسم المستخدم")
-            password = st.text_input("كلمة المرور", type="password")
-            password2 = st.text_input("تأكيد كلمة المرور", type="password")
-            submitted = st.form_submit_button("إنشاء الحساب")
-
+            full_name = st.text_input("اسم المدير", placeholder="الاسم الكامل")
+            username = st.text_input("اسم المستخدم", placeholder="اسم الدخول")
+            password = st.text_input("كلمة المرور", type="password", placeholder="6 أحرف على الأقل")
+            password2 = st.text_input("تأكيد كلمة المرور", type="password", placeholder="أعد كتابة كلمة المرور")
+            confirmed = st.checkbox("أؤكد أن بيانات الحساب صحيحة")
+            submitted = st.form_submit_button("إنشاء الحساب", use_container_width=True)
         if submitted:
             if not full_name.strip() or not username.strip() or not password:
                 st.error("أكمل جميع البيانات المطلوبة.")
+            elif not confirmed:
+                st.warning("ضع علامة التأكيد قبل إنشاء الحساب.")
             elif len(password) < 6:
                 st.error("كلمة المرور يجب أن تكون 6 أحرف على الأقل.")
             elif password != password2:
                 st.error("كلمتا المرور غير متطابقتين.")
             else:
-                execute(
-                    """
-                    INSERT INTO users
-                    (username, password_hash, full_name, role, active, created_at)
-                    VALUES (?, ?, ?, 'admin', 1, ?)
-                    """,
-                    (
-                        username.strip(),
-                        hash_password(password),
-                        full_name.strip(),
-                        now_text(),
-                    ),
-                )
+                execute("""INSERT INTO users (username, password_hash, full_name, role, active, created_at)
+                    VALUES (?, ?, ?, 'admin', 1, ?)""",
+                    (username.strip(), hash_password(password), full_name.strip(), now_text()))
                 st.success("تم إنشاء حساب المدير. يمكنك تسجيل الدخول الآن.")
                 st.rerun()
-        return
-
-    st.subheader("تسجيل الدخول")
-    with st.form("login_form"):
-        username = st.text_input("اسم المستخدم")
-        password = st.text_input("كلمة المرور", type="password")
-        submitted = st.form_submit_button("دخول")
-
-    if submitted:
-        if login_user(username, password):
-            st.rerun()
-        st.error("اسم المستخدم أو كلمة المرور غير صحيحة.")
-
-
+    else:
+        with st.form("login_form"):
+            username = st.text_input("اسم المستخدم", placeholder="اكتب اسم المستخدم")
+            password = st.text_input("كلمة المرور", type="password", placeholder="اكتب كلمة المرور")
+            submitted = st.form_submit_button("دخول", use_container_width=True)
+        if submitted:
+            if login_user(username, password):
+                st.rerun()
+            st.error("اسم المستخدم أو كلمة المرور غير صحيحة.")
+    st.markdown('</div>', unsafe_allow_html=True)
 def page_dashboard():
     st.subheader("لوحة التحكم")
+    st.markdown('<div class="section-note">نظرة سريعة على حركة المركز في اليوم والفترة الأخيرة.</div>', unsafe_allow_html=True)
 
     selected_date = st.date_input("التاريخ", today(), key="dashboard_date")
     date_str = str(selected_date)
@@ -585,130 +636,91 @@ def page_dashboard():
 
 def page_students():
     st.subheader("إدارة الطلاب")
+    st.caption("إضافة طالب جديد أو البحث عن طالب مسجل بدون تكرار.")
 
     tab_add, tab_list = st.tabs(["إضافة طالب", "قائمة الطلاب"])
-
     with tab_add:
-        with st.form("add_student"):
-            name = st.text_input("اسم الطالب الكامل")
-            phone = st.text_input("رقم الهاتف")
+        with st.form("add_student", clear_on_submit=True):
+            name = st.text_input("اسم الطالب الكامل", placeholder="مثال: محمد أحمد علي")
+            phone = st.text_input("رقم الهاتف", placeholder="01XXXXXXXXX")
             address = st.text_input("العنوان")
-            notes = st.text_area("ملاحظات")
-            save = st.form_submit_button("حفظ الطالب")
-
+            notes = st.text_area("ملاحظات", height=90)
+            confirmed = st.checkbox("أؤكد أن الطالب غير مسجل مسبقاً بهذه البيانات")
+            save = st.form_submit_button("حفظ الطالب", use_container_width=True)
         if save:
             if not name.strip():
                 st.error("اسم الطالب مطلوب.")
+            elif not confirmed:
+                st.warning("ضع علامة التأكيد قبل حفظ الطالب.")
             else:
                 code = generate_code("STU", "students")
                 try:
-                    student_id = execute(
-                        """
-                        INSERT INTO students
+                    student_id = execute("""INSERT INTO students
                         (student_code, name, phone, address, notes, active, created_at)
-                        VALUES (?, ?, ?, ?, ?, 1, ?)
-                        """,
-                        (
-                            code,
-                            name.strip(),
-                            phone.strip(),
-                            address.strip(),
-                            notes.strip(),
-                            now_text(),
-                        ),
-                        return_id=True,
-                    )
+                        VALUES (?, ?, ?, ?, ?, 1, ?)""",
+                        (code, name.strip(), phone.strip(), address.strip(), notes.strip(), now_text()),
+                        return_id=True)
                     log_action("إضافة طالب", "students", student_id, name.strip())
-                    st.success(f"تم حفظ الطالب. الرقم: {code}")
-                except sqlite3.IntegrityError:
-                    st.error("تعذر حفظ الطالب. تحقق من البيانات.")
-
+                    st.success(f"تم حفظ الطالب بنجاح — الرقم: {code}")
+                except sqlite3.IntegrityError as exc:
+                    if "DUPLICATE_STUDENT" in str(exc):
+                        st.error("هذا الطالب مسجل بالفعل. استخدم البحث في قائمة الطلاب.")
+                    else:
+                        st.error("تعذر حفظ الطالب. تحقق من البيانات.")
     with tab_list:
-        search = st.text_input("بحث بالاسم أو الرقم أو الهاتف", key="student_search")
+        search = st.text_input("بحث بالاسم أو الرقم أو الهاتف", key="student_search", placeholder="اكتب جزءاً من الاسم أو الرقم")
         term = f"%{search.strip()}%"
-        df = dataframe_query(
-            """
-            SELECT id AS 'ID',
-                   student_code AS 'رقم الطالب',
-                   name AS 'اسم الطالب',
-                   phone AS 'الهاتف',
-                   address AS 'العنوان',
+        df = dataframe_query("""SELECT id AS 'ID', student_code AS 'رقم الطالب', name AS 'اسم الطالب',
+                   phone AS 'الهاتف', address AS 'العنوان',
                    CASE WHEN active = 1 THEN 'نشط' ELSE 'موقوف' END AS 'الحالة'
-            FROM students
-            WHERE name LIKE ?
-               OR student_code LIKE ?
-               OR phone LIKE ?
-            ORDER BY id DESC
-            """,
-            (term, term, term),
-        )
+            FROM students WHERE name LIKE ? OR student_code LIKE ? OR phone LIKE ? ORDER BY id DESC""",
+            (term, term, term))
         st.dataframe(df, use_container_width=True, hide_index=True)
         if not df.empty:
             download_excel(df, "students.xlsx")
-
-
 def page_teachers():
     st.subheader("إدارة الأساتذة")
-
+    st.caption("إضافة الأستاذ مرة واحدة ثم ربطه بالكورسات من شاشة الكورسات.")
     tab_add, tab_list = st.tabs(["إضافة أستاذ", "قائمة الأساتذة"])
-
     with tab_add:
-        with st.form("add_teacher"):
-            name = st.text_input("اسم الأستاذ الكامل")
+        with st.form("add_teacher", clear_on_submit=True):
+            name = st.text_input("اسم الأستاذ الكامل", placeholder="مثال: أ. أحمد محمد")
             subject = st.text_input("المادة / التخصص")
             phone = st.text_input("رقم الهاتف")
             rate = st.number_input("سعر الساعة", min_value=0.0, step=100.0)
-            save = st.form_submit_button("حفظ الأستاذ")
-
+            confirmed = st.checkbox("أؤكد أن الأستاذ غير مسجل مسبقاً")
+            save = st.form_submit_button("حفظ الأستاذ", use_container_width=True)
         if save:
             if not name.strip():
                 st.error("اسم الأستاذ مطلوب.")
+            elif not confirmed:
+                st.warning("ضع علامة التأكيد قبل حفظ الأستاذ.")
             else:
                 code = generate_code("TCH", "teachers")
-                teacher_id = execute(
-                    """
-                    INSERT INTO teachers
-                    (teacher_code, name, subject, phone, hourly_rate, active, created_at)
-                    VALUES (?, ?, ?, ?, ?, 1, ?)
-                    """,
-                    (
-                        code,
-                        name.strip(),
-                        subject.strip(),
-                        phone.strip(),
-                        rate,
-                        now_text(),
-                    ),
-                    return_id=True,
-                )
-                log_action("إضافة أستاذ", "teachers", teacher_id, name.strip())
-                st.success(f"تم حفظ الأستاذ. الرقم: {code}")
-
+                try:
+                    teacher_id = execute("""INSERT INTO teachers
+                        (teacher_code, name, subject, phone, hourly_rate, active, created_at)
+                        VALUES (?, ?, ?, ?, ?, 1, ?)""",
+                        (code, name.strip(), subject.strip(), phone.strip(), rate, now_text()),
+                        return_id=True)
+                    log_action("إضافة أستاذ", "teachers", teacher_id, name.strip())
+                    st.success(f"تم حفظ الأستاذ بنجاح — الرقم: {code}")
+                except sqlite3.IntegrityError as exc:
+                    if "DUPLICATE_TEACHER" in str(exc):
+                        st.error("هذا الأستاذ مسجل بالفعل. استخدم قائمة الأساتذة.")
+                    else:
+                        st.error("تعذر حفظ الأستاذ. تحقق من البيانات.")
     with tab_list:
-        search = st.text_input("بحث بالاسم أو الرقم أو المادة", key="teacher_search")
+        search = st.text_input("بحث بالاسم أو الرقم أو المادة", key="teacher_search", placeholder="اكتب جزءاً من الاسم")
         term = f"%{search.strip()}%"
-        df = dataframe_query(
-            """
-            SELECT id AS 'ID',
-                   teacher_code AS 'رقم الأستاذ',
-                   name AS 'اسم الأستاذ',
-                   subject AS 'المادة',
-                   phone AS 'الهاتف',
-                   hourly_rate AS 'سعر الساعة',
+        df = dataframe_query("""SELECT id AS 'ID', teacher_code AS 'رقم الأستاذ', name AS 'اسم الأستاذ',
+                   subject AS 'المادة', phone AS 'الهاتف', hourly_rate AS 'سعر الساعة',
                    CASE WHEN active = 1 THEN 'نشط' ELSE 'موقوف' END AS 'الحالة'
-            FROM teachers
-            WHERE name LIKE ?
-               OR teacher_code LIKE ?
-               OR subject LIKE ?
-            ORDER BY id DESC
-            """,
-            (term, term, term),
-        )
+            FROM teachers WHERE name LIKE ? OR teacher_code LIKE ? OR subject LIKE ? ORDER BY id DESC""",
+            (term, term, term))
         st.dataframe(df, use_container_width=True, hide_index=True)
         if not df.empty:
             download_excel(df, "teachers.xlsx")
-
-
 def page_subjects_courses():
     st.subheader("المواد والكورسات")
 
@@ -778,34 +790,43 @@ def page_subjects_courses():
                 )
                 start_date = st.date_input("بداية الكورس", today())
                 end_date = st.date_input("نهاية الكورس", today())
-                save = st.form_submit_button("حفظ الكورس")
+                confirmed = st.checkbox("أؤكد أن هذا الكورس غير مسجل بنفس المادة والأستاذ")
+                save = st.form_submit_button("حفظ الكورس", use_container_width=True)
 
             if save:
                 if not course_name.strip():
                     st.error("اسم الكورس مطلوب.")
                 elif end_date < start_date:
                     st.error("نهاية الكورس لا يمكن أن تكون قبل البداية.")
+                elif not confirmed:
+                    st.warning("ضع علامة التأكيد قبل حفظ الكورس.")
                 else:
-                    course_id = execute(
-                        """
-                        INSERT INTO courses
-                        (name, subject_id, teacher_id, fee, total_sessions,
-                         start_date, end_date, active)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
-                        """,
-                        (
-                            course_name.strip(),
-                            subject_options[selected_subject],
-                            teacher_options[selected_teacher],
-                            fee,
-                            sessions,
-                            str(start_date),
-                            str(end_date),
-                        ),
-                        return_id=True,
-                    )
-                    log_action("إضافة كورس", "courses", course_id, course_name)
-                    st.success("تم حفظ الكورس.")
+                    try:
+                        course_id = execute(
+                            """
+                            INSERT INTO courses
+                            (name, subject_id, teacher_id, fee, total_sessions,
+                             start_date, end_date, active)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+                            """,
+                            (
+                                course_name.strip(),
+                                subject_options[selected_subject],
+                                teacher_options[selected_teacher],
+                                fee,
+                                sessions,
+                                str(start_date),
+                                str(end_date),
+                            ),
+                            return_id=True,
+                        )
+                        log_action("إضافة كورس", "courses", course_id, course_name)
+                        st.success("تم حفظ الكورس.")
+                    except sqlite3.IntegrityError as exc:
+                        if "DUPLICATE_COURSE" in str(exc):
+                            st.error("هذا الكورس مسجل بالفعل بنفس المادة والأستاذ.")
+                        else:
+                            st.error("تعذر حفظ الكورس. تحقق من البيانات.")
 
             courses = dataframe_query(
                 """
@@ -860,6 +881,8 @@ def page_subjects_courses():
                 save = st.form_submit_button("تسجيل الطالب")
 
             if save:
+                if not require_day_open(enrolled_date):
+                    return
                 try:
                     enrollment_id = execute(
                         """
@@ -941,6 +964,8 @@ def page_student_attendance():
         save = st.form_submit_button("تسجيل الحضور")
 
     if save:
+        if not require_day_open(attendance_date):
+            return
         student_id = student_options[selected_student]
         course_id = course_options[selected_course]
         teacher_id = course_teacher.get(course_id) if course_id else None
@@ -1061,6 +1086,8 @@ def page_payment():
         save = st.form_submit_button("حفظ العملية")
 
     if save:
+        if not require_day_open(payment_date):
+            return
         if amount <= 0:
             st.error("المبلغ يجب أن يكون أكبر من صفر.")
             return
@@ -1201,6 +1228,8 @@ def page_teacher_hours():
         save = st.form_submit_button("تسجيل الساعات")
 
     if save:
+        if not require_day_open(work_date):
+            return
         start = dt.datetime.combine(work_date, check_in)
         end = dt.datetime.combine(work_date, check_out)
 
@@ -1338,6 +1367,8 @@ def page_teacher_payroll():
             save = st.form_submit_button("تسجيل الدفع")
 
         if save:
+            if not require_day_open(payment_date):
+                return
             if amount <= 0:
                 st.error("المبلغ يجب أن يكون أكبر من صفر.")
             else:
@@ -1396,6 +1427,8 @@ def page_expenses():
         save = st.form_submit_button("حفظ المصروف")
 
     if save:
+        if not require_day_open(expense_date):
+            return
         if not description.strip():
             st.error("وصف المصروف مطلوب.")
         elif amount <= 0:
@@ -1453,125 +1486,179 @@ def page_expenses():
 
 def page_cashbox():
     st.subheader("الخزينة والإقفال اليومي")
+    st.caption("الإقفال يمنع إضافة أي حركة مالية أو حضور أو ساعات أو تسجيل في الكورس لذلك اليوم حتى يتم فتحه من المدير.")
 
-    selected_date = st.date_input("تاريخ الإقفال", today(), key="cashbox_date")
+    selected_date = st.date_input("تاريخ اليوم", today(), key="cashbox_date")
     date_str = str(selected_date)
+    closed = is_day_closed(date_str)
 
-    income = dataframe_query(
+    income = float(dataframe_query(
         """
         SELECT COALESCE(SUM(amount), 0) AS total
         FROM student_payments
-        WHERE date = ?
-          AND payment_method = 'كاش'
-          AND status = 'completed'
-        """,
-        (date_str,),
-    )["total"].iloc[0]
+        WHERE date = ? AND payment_method = 'كاش' AND status = 'completed'
+        """, (date_str,))["total"].iloc[0])
 
-    expense = dataframe_query(
+    expense = float(dataframe_query(
         """
         SELECT COALESCE(SUM(amount), 0) AS total
         FROM expenses
-        WHERE date = ?
-          AND payment_method = 'كاش'
-          AND status = 'completed'
-        """,
-        (date_str,),
-    )["total"].iloc[0]
+        WHERE date = ? AND payment_method = 'كاش' AND status = 'completed'
+        """, (date_str,))["total"].iloc[0])
 
-    teacher_paid = dataframe_query(
+    teacher_paid = float(dataframe_query(
         """
         SELECT COALESCE(SUM(amount), 0) AS total
         FROM teacher_payments
-        WHERE date = ?
-          AND payment_method = 'كاش'
-        """,
-        (date_str,),
-    )["total"].iloc[0]
+        WHERE date = ? AND payment_method = 'كاش'
+        """, (date_str,))["total"].iloc[0])
 
-    row = dataframe_query(
-        "SELECT * FROM cashbox WHERE date = ?", (date_str,)
-    )
+    bankak_income = float(dataframe_query(
+        """
+        SELECT COALESCE(SUM(amount), 0) AS total
+        FROM student_payments
+        WHERE date = ? AND payment_method = 'بنكك' AND status = 'completed'
+        """, (date_str,))["total"].iloc[0])
 
-    opening = float(row["opening_balance"].iloc[0]) if not row.empty else 0
+    row = dataframe_query("SELECT * FROM cashbox WHERE date = ?", (date_str,))
+    opening = float(row["opening_balance"].iloc[0]) if not row.empty else 0.0
     expected = opening + income - expense - teacher_paid
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("إيرادات الكاش", format_money(income))
-    c2.metric("مصروفات الكاش", format_money(expense + teacher_paid))
-    c3.metric("الرصيد المتوقع", format_money(expected))
+    if closed:
+        st.success(f"اليوم {date_str} مقفل بالفعل. لا توجد حركات جديدة مسموحة لهذا التاريخ.")
+    else:
+        st.info(f"اليوم {date_str} مفتوح للتسجيل.")
 
-    with st.form("cashbox_form"):
-        opening_balance = st.number_input(
-            "الرصيد الافتتاحي",
-            min_value=0.0,
-            value=opening,
-            step=100.0,
-        )
-        counted_cash = st.number_input(
-            "النقد الفعلي الموجود",
-            min_value=0.0,
-            step=100.0,
-        )
-        notes = st.text_input("ملاحظات")
-        close_day = st.form_submit_button("إقفال اليوم")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("كاش داخل", format_money(income))
+    c2.metric("بنكك", format_money(bankak_income))
+    c3.metric("كاش خارج", format_money(expense + teacher_paid))
+    c4.metric("الرصيد المتوقع", format_money(expected))
 
-    if close_day:
-        actual_expected = opening_balance + income - expense - teacher_paid
-        difference = counted_cash - actual_expected
-
-        conn = get_connection()
-        conn.execute(
-            """
-            INSERT INTO cashbox
-            (date, opening_balance, cash_in, cash_out,
-             counted_cash, difference, notes, closed_by, closed_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(date) DO UPDATE SET
-                opening_balance = excluded.opening_balance,
-                cash_in = excluded.cash_in,
-                cash_out = excluded.cash_out,
-                counted_cash = excluded.counted_cash,
-                difference = excluded.difference,
-                notes = excluded.notes,
-                closed_by = excluded.closed_by,
-                closed_at = excluded.closed_at
-            """,
-            (
-                date_str,
-                opening_balance,
-                income,
-                expense + teacher_paid,
-                counted_cash,
-                difference,
-                notes.strip(),
-                current_user()["id"],
-                now_text(),
-            ),
-        )
-        conn.commit()
-        conn.close()
-
-        log_action(
-            "إقفال الخزينة",
-            "cashbox",
-            None,
-            f"{date_str} - الفرق {difference}",
-        )
-
-        if difference == 0:
-            st.success("تم إقفال الخزينة. الرصيد الفعلي مطابق.")
-        else:
-            st.warning(
-                f"تم الإقفال. يوجد فرق في الخزينة: {format_money(difference)}"
+    if not closed:
+        with st.form("cashbox_form"):
+            opening_balance = st.number_input(
+                "الرصيد الافتتاحي", min_value=0.0, value=opening, step=100.0
             )
+            counted_cash = st.number_input(
+                "النقد الفعلي الموجود عند الإقفال", min_value=0.0, step=100.0
+            )
+            notes = st.text_input("ملاحظات الإقفال")
+            confirm_close = st.checkbox("أؤكد أنني راجعت عمليات اليوم وأريد إقفاله نهائياً")
+            close_day = st.form_submit_button("إقفال اليوم", use_container_width=True)
 
+        if close_day:
+            if not confirm_close:
+                st.warning("ضع علامة التأكيد قبل إقفال اليوم.")
+            elif not has_role("admin", "accountant"):
+                st.error("ليس لديك صلاحية إقفال اليوم.")
+            else:
+                actual_expected = opening_balance + income - expense - teacher_paid
+                difference = counted_cash - actual_expected
+                conn = get_connection()
+                try:
+                    conn.execute(
+                        """
+                        INSERT INTO cashbox
+                        (date, opening_balance, cash_in, cash_out, counted_cash,
+                         difference, notes, closed_by, closed_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(date) DO UPDATE SET
+                            opening_balance=excluded.opening_balance,
+                            cash_in=excluded.cash_in,
+                            cash_out=excluded.cash_out,
+                            counted_cash=excluded.counted_cash,
+                            difference=excluded.difference,
+                            notes=excluded.notes,
+                            closed_by=excluded.closed_by,
+                            closed_at=excluded.closed_at
+                        """,
+                        (date_str, opening_balance, income, expense + teacher_paid,
+                         counted_cash, difference, notes.strip(), current_user()["id"], now_text()),
+                    )
+                    conn.execute(
+                        """
+                        INSERT INTO day_closures (date, closed_by, closed_at, status, notes)
+                        VALUES (?, ?, ?, 'closed', ?)
+                        ON CONFLICT(date) DO UPDATE SET
+                            closed_by=excluded.closed_by,
+                            closed_at=excluded.closed_at,
+                            reopened_by=NULL,
+                            reopened_at=NULL,
+                            status='closed',
+                            notes=excluded.notes
+                        """,
+                        (date_str, current_user()["id"], now_text(), notes.strip()),
+                    )
+                    conn.commit()
+                except sqlite3.IntegrityError:
+                    conn.rollback()
+                    st.error("تعذر إقفال اليوم. تحقق من البيانات.")
+                    return
+                finally:
+                    conn.close()
+
+                log_action("إقفال اليوم", "day_closures", None,
+                           f"{date_str} - الفرق {difference}")
+                if difference == 0:
+                    st.success("تم إقفال اليوم بنجاح والرصيد مطابق.")
+                else:
+                    st.warning(f"تم إقفال اليوم. يوجد فرق: {format_money(difference)}")
+                st.rerun()
+
+    if closed and has_role("admin"):
+        st.markdown("### فتح اليوم")
+        st.warning("فتح اليوم يسمح بإضافة حركات جديدة. استخدمه فقط إذا اكتشفت خطأ أو عملية ناقصة.")
+        with st.form("reopen_day_form"):
+            reason = st.text_input("سبب فتح اليوم", placeholder="مثال: تصحيح عملية بنكك")
+            confirm_reopen = st.checkbox("أؤكد أنني أريد فتح هذا اليوم")
+            reopen = st.form_submit_button("فتح اليوم للمدير", use_container_width=True)
+        if reopen:
+            if not reason.strip():
+                st.error("سبب فتح اليوم مطلوب.")
+            elif not confirm_reopen:
+                st.warning("ضع علامة التأكيد أولاً.")
+            else:
+                conn = get_connection()
+                conn.execute(
+                    """
+                    UPDATE day_closures
+                    SET status='reopened', reopened_by=?, reopened_at=?, notes=COALESCE(notes,'') || ?
+                    WHERE date=? AND status='closed'
+                    """,
+                    (current_user()["id"], now_text(), f" | فتح: {reason.strip()}", date_str),
+                )
+                conn.commit()
+                conn.close()
+                log_action("فتح يوم مقفل", "day_closures", None, f"{date_str} - {reason.strip()}")
+                st.success("تم فتح اليوم. يمكنك الآن تصحيح أو إضافة العمليات.")
+                st.rerun()
+
+    st.markdown("### سجل الإقفال")
+    closure_df = dataframe_query(
+        """
+        SELECT d.date AS 'التاريخ',
+               CASE WHEN d.status='closed' THEN 'مقفل' ELSE 'مفتوح بعد الإقفال' END AS 'الحالة',
+               u.full_name AS 'أقفل بواسطة',
+               d.closed_at AS 'وقت الإقفال',
+               ru.full_name AS 'فتح بواسطة',
+               d.reopened_at AS 'وقت الفتح',
+               d.notes AS 'الملاحظات'
+        FROM day_closures d
+        LEFT JOIN users u ON u.id=d.closed_by
+        LEFT JOIN users ru ON ru.id=d.reopened_by
+        ORDER BY d.date DESC
+        LIMIT 100
+        """
+    )
+    st.dataframe(closure_df, use_container_width=True, hide_index=True)
 
 def page_reports():
     st.subheader("التقارير")
+    st.caption("اختر التقرير المطلوب. كل التقارير تستخدم نفس قاعدة البيانات وبها رقم بنكك عند الدفع ببنكك.")
 
-    tab_daily, tab_period, tab_audit = st.tabs(
-        ["تقرير يومي", "تقرير فترة", "سجل العمليات"]
+    tab_daily, tab_period, tab_attendance, tab_cash, tab_audit = st.tabs(
+        ["التقرير اليومي", "تقرير الفترة", "الحضور والساعات", "الخزينة", "سجل العمليات"]
     )
 
     with tab_daily:
@@ -1587,133 +1674,174 @@ def page_reports():
                    t.name AS 'الأستاذ',
                    p.amount AS 'المبلغ',
                    p.payment_method AS 'طريقة الدفع',
-                   p.transaction_number AS 'رقم بنكك',
+                   COALESCE(NULLIF(p.transaction_number,''), '-') AS 'رقم بنكك',
+                   p.date AS 'التاريخ',
                    p.status AS 'الحالة'
             FROM student_payments p
-            JOIN students s ON s.id = p.student_id
-            LEFT JOIN courses c ON c.id = p.course_id
-            LEFT JOIN teachers t ON t.id = p.teacher_id
-            WHERE p.date = ?
+            JOIN students s ON s.id=p.student_id
+            LEFT JOIN courses c ON c.id=p.course_id
+            LEFT JOIN teachers t ON t.id=p.teacher_id
+            WHERE p.date=?
             ORDER BY p.id DESC
-            """,
-            (date_str,),
+            """, (date_str,)
         )
 
         expenses = dataframe_query(
             """
-            SELECT id AS 'رقم المصروف',
-                   category AS 'البند',
-                   description AS 'الوصف',
-                   amount AS 'المبلغ',
-                   payment_method AS 'طريقة الدفع',
-                   reference AS 'المرجع'
-            FROM expenses
-            WHERE date = ?
-            ORDER BY id DESC
-            """,
-            (date_str,),
+            SELECT e.id AS 'رقم المصروف', e.category AS 'البند',
+                   e.description AS 'الوصف', e.amount AS 'المبلغ',
+                   e.payment_method AS 'طريقة الدفع',
+                   COALESCE(NULLIF(e.reference,''), '-') AS 'المرجع', e.date AS 'التاريخ'
+            FROM expenses e WHERE e.date=? ORDER BY e.id DESC
+            """, (date_str,)
         )
 
-        total_income = (
-            payments.loc[
-                payments["الحالة"] == "completed", "المبلغ"
-            ].sum()
-            if not payments.empty
-            else 0
+        teacher_payments = dataframe_query(
+            """
+            SELECT tp.id AS 'رقم الدفع', t.teacher_code AS 'رقم الأستاذ',
+                   t.name AS 'الأستاذ', tp.amount AS 'المبلغ',
+                   tp.payment_method AS 'طريقة الدفع', tp.notes AS 'ملاحظات', tp.date AS 'التاريخ'
+            FROM teacher_payments tp JOIN teachers t ON t.id=tp.teacher_id
+            WHERE tp.date=? ORDER BY tp.id DESC
+            """, (date_str,)
         )
-        total_expense = (
-            expenses["المبلغ"].sum() if not expenses.empty else 0
+
+        attendance = dataframe_query(
+            """
+            SELECT a.id AS 'ID', s.student_code AS 'رقم الطالب', s.name AS 'الطالب',
+                   c.name AS 'الكورس', t.name AS 'الأستاذ', a.check_in AS 'وقت الحضور',
+                   a.status AS 'الحالة', a.notes AS 'ملاحظات'
+            FROM student_attendance a JOIN students s ON s.id=a.student_id
+            LEFT JOIN courses c ON c.id=a.course_id LEFT JOIN teachers t ON t.id=a.teacher_id
+            WHERE a.date=? ORDER BY a.id DESC
+            """, (date_str,)
         )
 
-        c1, c2, c3 = st.columns(3)
-        c1.metric("الإيراد", format_money(total_income))
-        c2.metric("المصروف", format_money(total_expense))
-        c3.metric("الصافي", format_money(total_income - total_expense))
+        teacher_hours = dataframe_query(
+            """
+            SELECT h.id AS 'ID', t.teacher_code AS 'رقم الأستاذ', t.name AS 'الأستاذ',
+                   h.check_in AS 'الدخول', h.check_out AS 'الخروج', h.hours_worked AS 'الساعات',
+                   h.hours_worked*t.hourly_rate AS 'المستحق'
+            FROM teacher_hours h JOIN teachers t ON t.id=h.teacher_id
+            WHERE h.date=? ORDER BY h.id DESC
+            """, (date_str,)
+        )
 
-        st.markdown("### المدفوعات")
-        st.dataframe(payments, use_container_width=True, hide_index=True)
+        total_income = float(payments.loc[payments['الحالة']=='completed','المبلغ'].sum()) if not payments.empty else 0
+        total_expense = float(expenses['المبلغ'].sum()) if not expenses.empty else 0
+        total_teacher = float(teacher_payments['المبلغ'].sum()) if not teacher_payments.empty else 0
+        cash_income = float(payments.loc[(payments['الحالة']=='completed') & (payments['طريقة الدفع']=='كاش'),'المبلغ'].sum()) if not payments.empty else 0
+        bankak_income = float(payments.loc[(payments['الحالة']=='completed') & (payments['طريقة الدفع']=='بنكك'),'المبلغ'].sum()) if not payments.empty else 0
 
-        if not payments.empty:
-            download_excel(payments, f"payments_{date_str}.xlsx")
+        c1,c2,c3,c4,c5=st.columns(5)
+        c1.metric("إيرادات", format_money(total_income))
+        c2.metric("مصروفات", format_money(total_expense))
+        c3.metric("دفع الأساتذة", format_money(total_teacher))
+        c4.metric("كاش", format_money(cash_income))
+        c5.metric("بنكك", format_money(bankak_income))
+
+        st.markdown("### مدفوعات الطلاب")
+        if payments.empty:
+            st.info("لا توجد مدفوعات في هذا اليوم.")
+        else:
+            st.dataframe(payments, use_container_width=True, hide_index=True)
+            download_excel(payments, f"daily_payments_{date_str}.xlsx")
 
         st.markdown("### المصروفات")
-        st.dataframe(expenses, use_container_width=True, hide_index=True)
+        if expenses.empty:
+            st.info("لا توجد مصروفات في هذا اليوم.")
+        else:
+            st.dataframe(expenses, use_container_width=True, hide_index=True)
+            download_excel(expenses, f"daily_expenses_{date_str}.xlsx")
+
+        st.markdown("### مدفوعات الأساتذة")
+        st.dataframe(teacher_payments, use_container_width=True, hide_index=True)
+
+        st.markdown("### حضور الطلاب")
+        st.dataframe(attendance, use_container_width=True, hide_index=True)
+
+        st.markdown("### ساعات الأساتذة")
+        st.dataframe(teacher_hours, use_container_width=True, hide_index=True)
 
     with tab_period:
-        start_date = st.date_input(
-            "من", today().replace(day=1), key="period_start"
-        )
+        start_date = st.date_input("من", today().replace(day=1), key="period_start")
         end_date = st.date_input("إلى", today(), key="period_end")
-
         if end_date < start_date:
             st.error("الفترة غير صحيحة.")
         else:
             income = dataframe_query(
-                """
-                SELECT date, SUM(amount) AS income
-                FROM student_payments
-                WHERE date BETWEEN ? AND ?
-                  AND status = 'completed'
-                GROUP BY date
-                ORDER BY date
-                """,
-                (str(start_date), str(end_date)),
-            )
-            expense = dataframe_query(
-                """
-                SELECT date, SUM(amount) AS expense
-                FROM expenses
-                WHERE date BETWEEN ? AND ?
-                  AND status = 'completed'
-                GROUP BY date
-                ORDER BY date
-                """,
-                (str(start_date), str(end_date)),
-            )
+                """SELECT date, SUM(amount) AS income FROM student_payments
+                   WHERE date BETWEEN ? AND ? AND status='completed' GROUP BY date""",
+                (str(start_date),str(end_date)))
+            expenses = dataframe_query(
+                """SELECT date, SUM(amount) AS expense FROM expenses
+                   WHERE date BETWEEN ? AND ? AND status='completed' GROUP BY date""",
+                (str(start_date),str(end_date)))
+            teacher_paid = dataframe_query(
+                """SELECT date, SUM(amount) AS teacher_paid FROM teacher_payments
+                   WHERE date BETWEEN ? AND ? GROUP BY date""",
+                (str(start_date),str(end_date)))
+            report = pd.DataFrame({'date': pd.date_range(start_date,end_date)})
+            for part in (income,expenses,teacher_paid):
+                if not part.empty:
+                    part['date']=pd.to_datetime(part['date'])
+                    report=report.merge(part,on='date',how='left')
+            for col in ('income','expense','teacher_paid'):
+                if col not in report.columns: report[col]=0
+                report[col]=report[col].fillna(0)
+            report['net']=report['income']-report['expense']-report['teacher_paid']
+            st.dataframe(report,use_container_width=True,hide_index=True)
+            st.line_chart(report.set_index('date')[['income','expense','teacher_paid','net']])
+            st.metric("إجمالي الإيرادات",format_money(report['income'].sum()))
+            st.metric("إجمالي صافي الفترة",format_money(report['net'].sum()))
+            download_excel(report,"period_report.xlsx")
 
-            report = pd.merge(
-                income,
-                expense,
-                on="date",
-                how="outer",
-            ).fillna(0)
+    with tab_attendance:
+        selected_date=st.date_input("التاريخ",today(),key="report_attendance_date")
+        date_str=str(selected_date)
+        attendance=dataframe_query("""SELECT s.student_code AS 'رقم الطالب',s.name AS 'الطالب',
+            c.name AS 'الكورس',t.name AS 'الأستاذ',a.check_in AS 'الحضور',a.status AS 'الحالة',a.notes AS 'ملاحظات'
+            FROM student_attendance a JOIN students s ON s.id=a.student_id
+            LEFT JOIN courses c ON c.id=a.course_id LEFT JOIN teachers t ON t.id=a.teacher_id
+            WHERE a.date=? ORDER BY a.id DESC""",(date_str,))
+        hours=dataframe_query("""SELECT t.teacher_code AS 'رقم الأستاذ',t.name AS 'الأستاذ',
+            h.check_in AS 'الدخول',h.check_out AS 'الخروج',h.hours_worked AS 'الساعات',
+            h.hours_worked*t.hourly_rate AS 'المستحق'
+            FROM teacher_hours h JOIN teachers t ON t.id=h.teacher_id WHERE h.date=? ORDER BY h.id DESC""",(date_str,))
+        a,b=st.columns(2)
+        with a:
+            st.markdown("### حضور الطلاب")
+            st.dataframe(attendance,use_container_width=True,hide_index=True)
+        with b:
+            st.markdown("### ساعات الأساتذة")
+            st.dataframe(hours,use_container_width=True,hide_index=True)
 
-            if report.empty:
-                st.info("لا توجد عمليات في هذه الفترة.")
-            else:
-                report["net"] = report["income"] - report["expense"]
-                report["date"] = pd.to_datetime(report["date"])
-                st.dataframe(
-                    report,
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                st.line_chart(
-                    report.set_index("date")[["income", "expense", "net"]]
-                )
-                download_excel(report, "period_report.xlsx")
+    with tab_cash:
+        selected_date=st.date_input("التاريخ",today(),key="report_cash_date")
+        date_str=str(selected_date)
+        cash=dataframe_query("""SELECT payment_method AS 'طريقة الدفع',SUM(amount) AS 'الإجمالي',COUNT(*) AS 'عدد العمليات'
+            FROM student_payments WHERE date=? AND status='completed' GROUP BY payment_method""",(date_str,))
+        expenses=dataframe_query("""SELECT payment_method AS 'طريقة الدفع',SUM(amount) AS 'الإجمالي',COUNT(*) AS 'عدد العمليات'
+            FROM expenses WHERE date=? AND status='completed' GROUP BY payment_method""",(date_str,))
+        st.markdown("### ملخص التحصيل")
+        st.dataframe(cash,use_container_width=True,hide_index=True)
+        st.markdown("### ملخص المصروفات")
+        st.dataframe(expenses,use_container_width=True,hide_index=True)
+        closure=dataframe_query("""SELECT d.date AS 'التاريخ',CASE WHEN d.status='closed' THEN 'مقفل' ELSE 'مفتوح بعد الإقفال' END AS 'الحالة',
+            u.full_name AS 'أقفل بواسطة',d.closed_at AS 'وقت الإقفال',ru.full_name AS 'فتح بواسطة',d.reopened_at AS 'وقت الفتح',d.notes AS 'الملاحظات'
+            FROM day_closures d LEFT JOIN users u ON u.id=d.closed_by LEFT JOIN users ru ON ru.id=d.reopened_by WHERE d.date=?""",(date_str,))
+        st.markdown("### حالة إقفال اليوم")
+        st.dataframe(closure,use_container_width=True,hide_index=True)
 
     with tab_audit:
         if not has_role("admin"):
             st.info("سجل العمليات متاح للمدير فقط.")
         else:
-            df = dataframe_query(
-                """
-                SELECT a.id AS 'ID',
-                       COALESCE(u.username, 'system') AS 'المستخدم',
-                       a.action AS 'العملية',
-                       a.table_name AS 'الجدول',
-                       a.record_id AS 'رقم السجل',
-                       a.details AS 'التفاصيل',
-                       a.created_at AS 'التاريخ والوقت'
-                FROM audit_logs a
-                LEFT JOIN users u ON u.id = a.user_id
-                ORDER BY a.id DESC
-                LIMIT 1000
-                """
-            )
-            st.dataframe(df, use_container_width=True, hide_index=True)
-
+            df=dataframe_query("""SELECT a.id AS 'ID',COALESCE(u.username,'system') AS 'المستخدم',a.action AS 'العملية',
+                a.table_name AS 'الجدول',a.record_id AS 'رقم السجل',a.details AS 'التفاصيل',a.created_at AS 'التاريخ والوقت'
+                FROM audit_logs a LEFT JOIN users u ON u.id=a.user_id ORDER BY a.id DESC LIMIT 2000""")
+            st.dataframe(df,use_container_width=True,hide_index=True)
+            if not df.empty: download_excel(df,"audit_log.xlsx")
 
 def page_users():
     st.subheader("المستخدمون والصلاحيات")
@@ -1810,46 +1938,39 @@ def page_database_tools():
 
 
 def apply_css():
-    st.markdown(
-        """
-        <style>
-        .main {
-            background-color: #f4f6f8;
-            color: #333333;
-        }
-
-        div.stButton > button {
-            background-color: #1a2a3a;
-            color: #ffffff;
-            border-radius: 4px;
-            border: none;
-            padding: 9px 18px;
-            font-weight: 600;
-        }
-
-        div.stButton > button:hover {
-            background-color: #2b4c7e;
-            color: #ffffff;
-        }
-
-        h1, h2, h3 {
-            color: #1a2a3a;
-        }
-
-        [data-testid="stMetricValue"] {
-            font-size: 1.45rem;
-        }
-
-        .block-container {
-            padding-top: 2rem;
-            padding-bottom: 3rem;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
+    st.markdown("""
+    <style>
+    :root { --brand:#1f6f78; --brand-dark:#174f56; --surface:#fff; --page:#f3f6f8; --text:#20303a; --muted:#6b7b84; --border:#dfe7eb; }
+    .stApp { background:var(--page); }
+    .block-container { padding-top:1.6rem; padding-bottom:3rem; max-width:1450px; }
+    [data-testid="stSidebar"] { background:linear-gradient(180deg,#173f46 0%,#1f5d64 58%,#174f56 100%); }
+    [data-testid="stSidebar"] * { color:#f5f8f9 !important; }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label { border-radius:9px; padding:7px 10px; transition:.18s ease; }
+    [data-testid="stSidebar"] [data-testid="stRadio"] label:hover { background:rgba(255,255,255,.09); transform:translateX(-2px); }
+    h1,h2,h3,h4 { color:var(--text) !important; letter-spacing:-.2px; }
+    p,label,.stMarkdown,.stCaption { color:var(--text); }
+    input,textarea,[data-baseweb="select"] > div { color:var(--text) !important; background:#fff !important; border-color:var(--border) !important; }
+    input::placeholder,textarea::placeholder { color:#8b989f !important; opacity:1 !important; }
+    div.stButton > button { border:0; border-radius:9px; min-height:42px; font-weight:650; transition:transform .16s ease,box-shadow .16s ease; }
+    div.stButton > button:hover { transform:translateY(-1px); box-shadow:0 7px 18px rgba(25,55,65,.12); }
+    [data-testid="stForm"] { border:1px solid var(--border); border-radius:14px; background:rgba(255,255,255,.84); padding:8px 10px 2px; box-shadow:0 5px 18px rgba(32,48,58,.045); }
+    [data-testid="stMetric"] { background:#fff; border:1px solid var(--border); border-radius:14px; padding:14px 16px; box-shadow:0 5px 16px rgba(32,48,58,.045); animation:rise .45s ease both; }
+    [data-testid="stMetricValue"] { color:var(--brand-dark) !important; font-size:1.5rem !important; }
+    [data-testid="stDataFrame"] { border-radius:12px; overflow:hidden; border:1px solid var(--border); }
+    .app-header { background:linear-gradient(120deg,#1b5961 0%,#267b82 100%); color:white; border-radius:17px; padding:24px 28px; margin-bottom:22px; box-shadow:0 10px 28px rgba(24,75,83,.16); position:relative; overflow:hidden; animation:fadeSlide .5s ease both; }
+    .app-header:after { content:""; position:absolute; width:230px; height:230px; border:1px solid rgba(255,255,255,.12); border-radius:50%; left:-70px; bottom:-150px; }
+    .app-header h1 { color:white !important; margin:0 0 5px 0; font-size:1.8rem; }
+    .app-header p { color:rgba(255,255,255,.82) !important; margin:0; }
+    .login-shell { max-width:520px; margin:7vh auto 0; background:#fff; border:1px solid var(--border); border-radius:18px; padding:30px 32px 24px; box-shadow:0 16px 45px rgba(25,55,65,.10); animation:loginIn .55s ease both; }
+    .login-brand { color:var(--brand); font-size:14px; font-weight:700; margin-bottom:8px; }
+    .login-title { color:var(--text); font-size:28px; font-weight:800; }
+    .login-subtitle { color:var(--muted); margin:4px 0 22px; font-size:14px; }
+    .section-note { color:var(--muted); margin-top:-7px; margin-bottom:14px; }
+    @keyframes fadeSlide { from{opacity:0;transform:translateY(7px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes rise { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+    @keyframes loginIn { from{opacity:0;transform:translateY(12px) scale(.99)} to{opacity:1;transform:translateY(0) scale(1)} }
+    </style>
+    """, unsafe_allow_html=True)
 def main():
     st.set_page_config(
         page_title="نظام إدارة المركز التعليمي",
@@ -1867,11 +1988,17 @@ def main():
 
     user = current_user()
 
-    st.sidebar.title("نظام إدارة المركز")
-    st.sidebar.write(user["full_name"])
+    st.markdown(
+        f"""<div class="app-header"><h1>نظام إدارة المركز التعليمي</h1>
+        <p>مرحباً {user["full_name"]} — إدارة الطلاب والكورسات والحضور والمدفوعات في مكان واحد.</p></div>""",
+        unsafe_allow_html=True,
+    )
+
+    st.sidebar.markdown("### نظام إدارة المركز")
+    st.sidebar.caption(f"المستخدم: {user['full_name']}")
     st.sidebar.caption(f"الصلاحية: {user['role']}")
 
-    if st.sidebar.button("تسجيل الخروج"):
+    if st.sidebar.button("تسجيل الخروج", use_container_width=True):
         logout()
 
     menu = ["لوحة التحكم"]
@@ -1901,7 +2028,7 @@ def main():
             "النسخ الاحتياطي",
         ]
 
-    choice = st.sidebar.radio("القائمة", menu)
+    choice = st.sidebar.radio("القائمة الرئيسية", menu)
 
     if choice == "لوحة التحكم":
         page_dashboard()
